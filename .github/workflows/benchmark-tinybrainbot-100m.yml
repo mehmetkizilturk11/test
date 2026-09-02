@@ -116,12 +116,12 @@ jobs:
             -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=ON
           cmake --build llama.cpp/build-host --target llama-quantize llama-simple -j2
 
-      - name: Quantize IQ2_M and Q3_K_M
+      - name: Quantize Q2_K and Q3_K_M
         run: |
           set -o pipefail
           Q=llama.cpp/build-host/bin/llama-quantize
           SRC=out/models/TinyBrainBot-100M-v3-Instruct.F16.gguf
-          "$Q" "$SRC" out/models/TinyBrainBot-100M-v3-Instruct.IQ2_M.gguf IQ2_M 2>&1 | tee out/info/quant-iq2m.txt
+          "$Q" "$SRC" out/models/TinyBrainBot-100M-v3-Instruct.Q2_K.gguf Q2_K 2>&1 | tee out/info/quant-q2k.txt
           "$Q" "$SRC" out/models/TinyBrainBot-100M-v3-Instruct.Q3_K_M.gguf Q3_K_M 2>&1 | tee out/info/quant-q3km.txt
           rm "$SRC"
           ls -lh out/models/*.gguf | tee out/info/model-sizes.txt
