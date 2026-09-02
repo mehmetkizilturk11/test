@@ -135,11 +135,7 @@ jobs:
             LOG="out/info/${N}.txt"
             echo "=== $N ===" | tee "$LOG"
             for Q in 'What is the capital of France? Answer briefly.' 'What is 2+2? Answer briefly.' 'Explain gravity in one short sentence.'; do
-              P="<|user|>
-$Q
-<|end|>
-<|assistant|>
-"
+              P=$(printf '%s\n%s\n%s\n%s\n' '<|user|>' "$Q" '<|end|>' '<|assistant|>')
               echo "Q: $Q" | tee -a "$LOG"
               "$R" -m "$M" -c 128 -n 48 -t 2 --temp 0.65 --top-k 40 --top-p 0.90 --repeat 1.12 --seed 1 -p "$P" 2>&1 | tee -a "$LOG"
             done
