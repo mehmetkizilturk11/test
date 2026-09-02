@@ -1,0 +1,203 @@
+name: build-miyooai-models-v3
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-miyooai-models-v3.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  models:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build curl unzip git git-lfs python3 python3-pip file
+          git lfs install
+          python3 -m pip install --break-system-packages --upgrade numpy sentencepiece transformers safetensors protobuf 'huggingface_hub[hf_xet]'
+          python3 -m pip install --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Reuse successful Miyoo runtime and Stentor model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/artifacts/9848844132/zip \
+            -o previous.zip
+          mkdir previous
+          unzip -q previous.zip -d previous
+          find previous -maxdepth 4 -type f -printf '%p %k KB\n' | sort
+          test -f previous/out/bin/miyoo-infer
+          test -f previous/out/models/Stentor-30M-Instruct.Q4_K_M.gguf
+          cp -a previous/out ./out
+          chmod +x out/bin/miyoo-infer
+
+      - name: Clone pinned llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin b81c99b479d4c24e5eeca10de99032ebd343ef8f
+          git -C llama.cpp checkout --detach FETCH_HEAD
+          echo b81c99b479d4c24e5eeca10de99032ebd343ef8f > out/info/llama-commit.txt
+
+      - name: Patch Syko GPT2 ByteLevel tokenizer mapping
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('llama.cpp/conversion/base.py')
+          s = p.read_text()
+          needle = '        if res is None:\n'
+          patch = '''        if chkhsh == "25877d97615bcc3ffed80d36fa2e2b1250fc4b9fceb1f8fcdd01997232d4e8c3":\n            # SykoSLM/SykoLLM-V1.2-Turkish-Instruct uses GPT-2 ByteLevel BPE.\n            res = "gpt-2"\n\n'''
+          if needle not in s:
+              raise SystemExit('converter insertion point not found')
+          s = s.replace(needle, patch + needle, 1)
+          p.write_text(s)
+          print('Syko tokenizer hash mapped to gpt-2')
+          PY
+          grep -n -A4 -B2 '25877d97615bcc3f' llama.cpp/conversion/base.py
+
+      - name: Download Syko Turkish 51M
+        run: |
+          hf download SykoSLM/SykoLLM-V1.2-Turkish-Instruct --local-dir syko-hf
+          test -s syko-hf/model.safetensors
+          test -s syko-hf/tokenizer.json
+          cp syko-hf/config.json out/info/syko-config.json
+          ls -lh syko-hf/model.safetensors syko-hf/tokenizer.json
+
+      - name: Record reference HF tokenization
+        run: |
+          python3 - <<'PY' | tee out/info/syko-hf-tokenizer-test.txt
+          from transformers import AutoTokenizer
+          t=AutoTokenizer.from_pretrained('syko-hf')
+          tests=[
+              '<user> Türkiye nin başkenti neresidir? Kısa cevap ver.<assistant>',
+              'Merhaba dünya! Türkçe karakterler: çğıöşü ÇĞİÖŞÜ',
+              'İstanbul neden kalabalık?'
+          ]
+          for x in tests:
+              ids=t.encode(x)
+              print('TEXT:',repr(x))
+              print('IDS:',ids)
+              print('DECODE:',repr(t.decode(ids)))
+          print('tokenizer_class=',type(t).__name__)
+          print('add_prefix_space=',getattr(t,'add_prefix_space',None))
+          PY
+
+      - name: Convert Syko GPT2 to GGUF F16
+        run: |
+          python3 llama.cpp/convert_hf_to_gguf.py syko-hf \
+            --outfile out/models/Syko.F16.gguf --outtype f16 \
+            2>&1 | tee out/info/syko-convert.txt
+          test -s out/models/Syko.F16.gguf
+          ls -lh out/models/Syko.F16.gguf
+
+      - name: Build host quantizer and simple runtime
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-host --target llama-quantize llama-simple -j2
+
+      - name: Quantize Syko to Q4_K_M
+        run: |
+          llama.cpp/build-host/bin/llama-quantize \
+            out/models/Syko.F16.gguf \
+            out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf \
+            Q4_K_M 2>&1 | tee out/info/syko-quantize.txt
+          rm out/models/Syko.F16.gguf
+          test -s out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf
+          ls -lh out/models/*.gguf | tee out/info/model-sizes.txt
+
+      - name: Host sanity test Stentor
+        run: |
+          set -o pipefail
+          llama.cpp/build-host/bin/llama-simple \
+            -m out/models/Stentor-30M-Instruct.Q4_K_M.gguf -ngl 0 -n 24 \
+            '[INST] What is the capital of France? Answer briefly.[/INST]' \
+            2>&1 | tee out/info/stentor-host-test.txt
+
+      - name: Host sanity test Syko
+        run: |
+          set -o pipefail
+          llama.cpp/build-host/bin/llama-simple \
+            -m out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf -ngl 0 -n 32 \
+            '<user> Türkiye nin başkenti neresidir? Kısa cevap ver.<assistant>' \
+            2>&1 | tee out/info/syko-host-test.txt
+
+      - name: Write physical Miyoo test scripts
+        run: |
+          cat > out/test-stentor.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); L="$D/stentor-miyoo.log"
+          echo '=== MiyooAI Stentor 30M Q4_K_M ===' > "$L"
+          date >> "$L" 2>&1 || true; free -k >> "$L" 2>&1 || true
+          "$D/bin/miyoo-infer" -m "$D/models/Stentor-30M-Instruct.Q4_K_M.gguf" -c 128 -n 32 -t 2 -p '[INST] What is the capital of France? Answer briefly.[/INST]' >> "$L" 2>&1
+          R=$?; free -k >> "$L" 2>&1 || true; echo "exit_code=$R" >> "$L"; cat "$L"; exit $R
+          EOF
+          cat > out/test-syko.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); L="$D/syko-miyoo.log"
+          echo '=== MiyooAI Syko Turkish 51M Q4_K_M ===' > "$L"
+          date >> "$L" 2>&1 || true; free -k >> "$L" 2>&1 || true
+          "$D/bin/miyoo-infer" -m "$D/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -c 128 -n 32 -t 2 -p '<user> Türkiye nin başkenti neresidir? Kısa cevap ver.<assistant>' >> "$L" 2>&1
+          R=$?; free -k >> "$L" 2>&1 || true; echo "exit_code=$R" >> "$L"; cat "$L"; exit $R
+          EOF
+          cat > out/ask-stentor.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); Q="$*"; [ -n "$Q" ] || Q='Hello, introduce yourself briefly.'
+          exec "$D/bin/miyoo-infer" -m "$D/models/Stentor-30M-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 -p "[INST] $Q[/INST]"
+          EOF
+          cat > out/ask-syko.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); Q="$*"; [ -n "$Q" ] || Q='Selam, kendini kısaca tanıtır mısın?'
+          exec "$D/bin/miyoo-infer" -m "$D/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 -p "<user> $Q<assistant>"
+          EOF
+          chmod +x out/*.sh out/bin/miyoo-infer
+          cat > out/README.txt <<'EOF'
+          MiyooAI native/offline proof-of-concept
+          Target: Miyoo Mini Plus / OnionOS / Cortex-A7 ARMv7-A / 128 MB RAM
+
+          Models:
+          - Stentor-30M-Instruct Q4_K_M (English/general)
+          - SykoLLM-V1.2-Turkish-Instruct Q4_K_M (Turkish)
+
+          First physical-device test:
+          1. Copy this folder to the SD card.
+          2. Run ./test-stentor.sh
+          3. Run ./test-syko.sh
+          4. Return stentor-miyoo.log and syko-miyoo.log.
+
+          Conservative starting limits: context=128, output=32, threads=2.
+          Do not increase context until peak RAM is measured on the physical Miyoo.
+          EOF
+          sha256sum out/bin/miyoo-infer out/models/*.gguf | tee out/info/SHA256SUMS.txt
+          du -h out/bin/miyoo-infer out/models/*.gguf | tee out/info/final-sizes.txt
+
+      - name: Upload MiyooAI native package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-native-Stentor30M-Syko51M
+          path: out/
+          compression-level: 6
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-models-v3-failure
+          path: out/
+          if-no-files-found: ignore
+          compression-level: 6
