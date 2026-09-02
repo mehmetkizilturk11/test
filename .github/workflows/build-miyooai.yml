@@ -6,7 +6,7 @@ on:
       - '.github/workflows/build-miyooai.yml'
   workflow_dispatch:
 
-# Trigger revision 2
+# Trigger revision 3
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -44,14 +44,14 @@ jobs:
             -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=ON
-          cmake --build llama.cpp/build-miyoo --target llama-cli llama-bench llama-quantize -j2
+          cmake --build llama.cpp/build-miyoo --target llama llama-bench llama-quantize -j2
           mkdir -p out/bin out/models out/info
-          cp llama.cpp/build-miyoo/bin/llama-cli out/bin/
+          cp llama.cpp/build-miyoo/bin/llama out/bin/
           cp llama.cpp/build-miyoo/bin/llama-bench out/bin/
           cp llama.cpp/build-miyoo/bin/llama-quantize out/bin/ || true
-          arm-linux-gnueabihf-strip out/bin/llama-cli out/bin/llama-bench || true
+          arm-linux-gnueabihf-strip out/bin/llama out/bin/llama-bench || true
           file out/bin/* | tee out/info/file.txt
-          arm-linux-gnueabihf-readelf -d out/bin/llama-cli | tee out/info/dynamic.txt
+          arm-linux-gnueabihf-readelf -d out/bin/llama | tee out/info/dynamic.txt
 
       - name: Download Stentor Q4_K_M
         run: |
@@ -78,12 +78,12 @@ jobs:
           cat > out/bench-stentor.sh <<'EOF'
           #!/bin/sh
           DIR=$(cd -- "$(dirname "$0")" && pwd)
-          /usr/bin/time -v "$DIR/bin/llama-cli" -m "$DIR/models/Stentor-30M-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 --no-display-prompt -p "User: What is the capital of France?\nAssistant:"
+          /usr/bin/time -v "$DIR/bin/llama" cli -m "$DIR/models/Stentor-30M-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 --no-display-prompt -p "User: What is the capital of France?\nAssistant:"
           EOF
           cat > out/bench-syko.sh <<'EOF'
           #!/bin/sh
           DIR=$(cd -- "$(dirname "$0")" && pwd)
-          /usr/bin/time -v "$DIR/bin/llama-cli" -m "$DIR/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 --no-display-prompt -p "<user> Türkiye'nin başkenti neresidir?<assistant>"
+          /usr/bin/time -v "$DIR/bin/llama" cli -m "$DIR/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 --no-display-prompt -p "<user> Türkiye'nin başkenti neresidir?<assistant>"
           EOF
           chmod +x out/*.sh
           cat > out/README.txt <<'EOF'
