@@ -6,7 +6,7 @@ on:
       - '.github/workflows/build-miyooai.yml'
   workflow_dispatch:
 
-# Revision 7 - minimal llama core runtime for 128 MB Miyoo Mini Plus
+# Revision 8 - deterministic Cortex-A7 build, no ARMv8 feature leakage
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -30,8 +30,13 @@ jobs:
           "$TC"g++ --version
           "$TC"gcc --print-sysroot || true
 
-      - name: Clone llama.cpp
-        run: git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+      - name: Clone pinned llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin b81c99b479d4c24e5eeca10de99032ebd343ef8f
+          git -C llama.cpp checkout --detach FETCH_HEAD
+          echo "llama.cpp commit: $(git -C llama.cpp rev-parse HEAD)"
 
       - name: Install minimal Miyoo inference source
         run: |
@@ -173,7 +178,6 @@ jobs:
 
               llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
               int generated = 0;
-              int pos = 0;
               const int64_t t_gen0 = ggml_time_us();
 
               while (generated < n_predict) {
@@ -181,7 +185,6 @@ jobs:
                       fprintf(stderr, "\n[ERROR] llama_decode failed\n");
                       break;
                   }
-                  pos += batch.n_tokens;
 
                   llama_token id = llama_sampler_sample(sampler, ctx, -1);
                   if (llama_vocab_is_eog(vocab, id)) break;
@@ -228,12 +231,28 @@ jobs:
           set(CMAKE_C_FLAGS "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -O2")
           set(CMAKE_CXX_FLAGS "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -O2")
           set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++")
+
+          # Cross compilation must never auto-detect the x86 Actions host CPU.
+          # Force the ggml ARM backend to the Miyoo Mini Plus Cortex-A7 baseline.
+          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ARM_ARCH "armv7-a" CACHE STRING "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_dotprod FALSE CACHE INTERNAL "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_nodotprod FALSE CACHE INTERNAL "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_i8mm FALSE CACHE INTERNAL "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_noi8mm FALSE CACHE INTERNAL "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_sve FALSE CACHE INTERNAL "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_nosve FALSE CACHE INTERNAL "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_sme FALSE CACHE INTERNAL "" FORCE)
+          set(GGML_MACHINE_SUPPORTS_nosme FALSE CACHE INTERNAL "" FORCE)
           EOF
+
           cmake -S llama.cpp -B llama.cpp/build-miyoo -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$PWD/miyoo-toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=OFF \
             -DGGML_CPU_ARM_ARCH=armv7-a \
             -DGGML_OPENMP=OFF \
             -DGGML_BLAS=OFF \
@@ -245,6 +264,16 @@ jobs:
             -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=ON
+
+          echo '=== Miyoo ARM CMake cache ==='
+          grep -E '^(GGML_NATIVE|GGML_CPU_ALL_VARIANTS|GGML_CPU_ARM_ARCH|GGML_MACHINE_SUPPORTS_(dotprod|i8mm|sve|sme))' \
+            llama.cpp/build-miyoo/CMakeCache.txt || true
+          echo '=== Suspicious ARMv8/native flags (must be empty) ==='
+          if grep -E -- '-mcpu=native|\+dotprod|\+i8mm|\+sve|\+sme' llama.cpp/build-miyoo/build.ninja; then
+            echo 'ERROR: ARMv8/native CPU flags leaked into the Cortex-A7 build'
+            exit 21
+          fi
+
           cmake --build llama.cpp/build-miyoo --target llama-simple -j2
           mkdir -p out/bin out/models out/info
           cp llama.cpp/build-miyoo/bin/llama-simple out/bin/miyoo-infer
