@@ -1,0 +1,189 @@
+name: benchmark-better-micro-models
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/benchmark-better-micro-models.yml'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git python3 python3-pip
+          python3 -m pip install --break-system-packages --upgrade numpy sentencepiece transformers safetensors protobuf 'huggingface_hub[hf_xet]'
+          python3 -m pip install --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch
+          mkdir -p bench models
+
+      - name: Clone pinned llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin b81c99b479d4c24e5eeca10de99032ebd343ef8f
+          git -C llama.cpp checkout --detach FETCH_HEAD
+
+      - name: Install sampled host runner
+        run: |
+          cat > llama.cpp/examples/simple/simple.cpp <<'CPP'
+          #include "llama.h"
+          #include <algorithm>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <string>
+          #include <vector>
+
+          int main(int argc, char ** argv) {
+              std::string model, prompt;
+              int n_predict=48, n_ctx=256, threads=2, top_k=50;
+              float temp=0.7f, top_p=0.9f, repeat=1.15f;
+              uint32_t seed=1;
+              for (int i=1;i<argc;i++) {
+                  if (!strcmp(argv[i],"-m") && i+1<argc) model=argv[++i];
+                  else if (!strcmp(argv[i],"-p") && i+1<argc) prompt=argv[++i];
+                  else if (!strcmp(argv[i],"-n") && i+1<argc) n_predict=atoi(argv[++i]);
+                  else if (!strcmp(argv[i],"-c") && i+1<argc) n_ctx=atoi(argv[++i]);
+                  else if (!strcmp(argv[i],"-t") && i+1<argc) threads=atoi(argv[++i]);
+                  else if (!strcmp(argv[i],"--temp") && i+1<argc) temp=atof(argv[++i]);
+                  else if (!strcmp(argv[i],"--top-k") && i+1<argc) top_k=atoi(argv[++i]);
+                  else if (!strcmp(argv[i],"--top-p") && i+1<argc) top_p=atof(argv[++i]);
+                  else if (!strcmp(argv[i],"--repeat") && i+1<argc) repeat=atof(argv[++i]);
+                  else if (!strcmp(argv[i],"--seed") && i+1<argc) seed=(uint32_t)strtoul(argv[++i],nullptr,10);
+              }
+              if (model.empty() || prompt.empty()) return 2;
+              llama_model_params mp=llama_model_default_params(); mp.n_gpu_layers=0;
+              llama_model * m=llama_model_load_from_file(model.c_str(),mp); if(!m) return 3;
+              const llama_vocab * v=llama_model_get_vocab(m);
+              int np=-llama_tokenize(v,prompt.c_str(),prompt.size(),nullptr,0,true,true);
+              std::vector<llama_token> toks(np);
+              if (llama_tokenize(v,prompt.c_str(),prompt.size(),toks.data(),toks.size(),true,true)<0) return 4;
+              llama_context_params cp=llama_context_default_params(); cp.n_ctx=n_ctx; cp.n_batch=std::min(np,n_ctx); cp.no_perf=false;
+              llama_context * ctx=llama_init_from_model(m,cp); if(!ctx) return 5;
+              llama_set_n_threads(ctx,threads,threads);
+              auto sp=llama_sampler_chain_default_params(); sp.no_perf=false;
+              llama_sampler * sm=llama_sampler_chain_init(sp);
+              llama_sampler_chain_add(sm,llama_sampler_init_penalties(llama_vocab_n_tokens(v),64,repeat,0.0f,0.0f));
+              llama_sampler_chain_add(sm,llama_sampler_init_top_k(top_k));
+              llama_sampler_chain_add(sm,llama_sampler_init_top_p(top_p,1));
+              llama_sampler_chain_add(sm,llama_sampler_init_temp(temp));
+              llama_sampler_chain_add(sm,llama_sampler_init_dist(seed));
+              llama_batch batch=llama_batch_get_one(toks.data(),toks.size());
+              int generated=0;
+              int64_t t0=ggml_time_us();
+              while(generated<n_predict) {
+                  if(llama_decode(ctx,batch)!=0) break;
+                  llama_token id=llama_sampler_sample(sm,ctx,-1);
+                  llama_sampler_accept(sm,id);
+                  if(llama_vocab_is_eog(v,id)) break;
+                  char piece[512]; int len=llama_token_to_piece(v,id,piece,sizeof(piece),0,true);
+                  if(len<0) break;
+                  fwrite(piece,1,len,stdout); fflush(stdout);
+                  batch=llama_batch_get_one(&id,1); generated++;
+              }
+              printf("\n");
+              double sec=(ggml_time_us()-t0)/1000000.0;
+              fprintf(stderr,"[BENCH] generated=%d time=%.3fs speed=%.2f tok/s\n",generated,sec,sec>0?generated/sec:0.0);
+              llama_sampler_free(sm); llama_free(ctx); llama_model_free(m);
+              return 0;
+          }
+          CPP
+          cat > llama.cpp/examples/simple/CMakeLists.txt <<'CMAKE'
+          set(TARGET llama-simple)
+          add_executable(${TARGET} simple.cpp)
+          install(TARGETS ${TARGET} RUNTIME)
+          target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+          target_compile_features(${TARGET} PRIVATE cxx_std_17)
+          CMAKE
+
+      - name: Download Supra 50M and Asena 12M
+        run: |
+          hf download SupraLabs/Supra-50M-Instruct --local-dir supra-hf
+          hf download pthinc/Asena_ESP32_MAX --include 'gguf/asena_esp32max_q4_k_m.gguf' --local-dir asena-hf
+          test -s asena-hf/gguf/asena_esp32max_q4_k_m.gguf
+          ls -lh asena-hf/gguf/asena_esp32max_q4_k_m.gguf | tee bench/asena-q4-size.txt
+
+      - name: HF reference outputs
+        run: |
+          python3 - <<'PY' 2>&1 | tee bench/hf-reference.txt
+          import torch
+          from transformers import AutoTokenizer, AutoModelForCausalLM
+          torch.manual_seed(1)
+
+          print('=== SUPRA HF ===')
+          tok=AutoTokenizer.from_pretrained('supra-hf',clean_up_tokenization_spaces=False)
+          m=AutoModelForCausalLM.from_pretrained('supra-hf').eval()
+          def supra_prompt(q):
+              return 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n'+q+'\n\n### Response:\n'
+          for q in ['What is the capital of France? Answer with only the city.','What is 2+2? Answer briefly.','Explain gravity in one short sentence.']:
+              p=supra_prompt(q); ids=tok(p,return_tensors='pt').input_ids
+              out=m.generate(ids,max_new_tokens=48,do_sample=True,temperature=0.7,top_k=50,top_p=0.9,repetition_penalty=1.15,pad_token_id=tok.eos_token_id)
+              print('Q:',q); print('A:',repr(tok.decode(out[0,ids.shape[1]:],skip_special_tokens=True)))
+          del m
+
+          print('=== ASENA HF ===')
+          tok=AutoTokenizer.from_pretrained('pthinc/Asena_ESP32_MAX')
+          m=AutoModelForCausalLM.from_pretrained('pthinc/Asena_ESP32_MAX').eval()
+          def asena_prompt(q):
+              return 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n'+q+'\n\n### Response:\n'
+          for q in ["Türkiye'nin başkenti neresi? Tek kelime cevap ver.",'2+2 kaçtır? Kısa cevap ver.','Merhaba, nasılsın?']:
+              p=asena_prompt(q); ids=tok(p,return_tensors='pt').input_ids
+              out=m.generate(ids,max_new_tokens=48,do_sample=True,temperature=0.7,top_k=50,top_p=0.9,repetition_penalty=1.15,pad_token_id=tok.eos_token_id)
+              print('Q:',q); print('A:',repr(tok.decode(out[0,ids.shape[1]:],skip_special_tokens=True)))
+          PY
+
+      - name: Convert Supra F16 GGUF
+        run: |
+          python3 llama.cpp/convert_hf_to_gguf.py supra-hf --outfile models/Supra-50M-Instruct.F16.gguf --outtype f16 2>&1 | tee bench/supra-convert.txt
+
+      - name: Build host runner and quantizer
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-host --target llama-quantize llama-simple -j2
+
+      - name: Quantize Supra Q4_K_M
+        run: |
+          llama.cpp/build-host/bin/llama-quantize models/Supra-50M-Instruct.F16.gguf models/Supra-50M-Instruct.Q4_K_M.gguf Q4_K_M 2>&1 | tee bench/supra-quant.txt
+          rm models/Supra-50M-Instruct.F16.gguf
+          ls -lh models/Supra-50M-Instruct.Q4_K_M.gguf | tee bench/supra-q4-size.txt
+
+      - name: GGUF sampled benchmark Supra
+        run: |
+          R=llama.cpp/build-host/bin/llama-simple
+          M=models/Supra-50M-Instruct.Q4_K_M.gguf
+          for Q in 'What is the capital of France? Answer with only the city.' 'What is 2+2? Answer briefly.' 'Explain gravity in one short sentence.'; do
+            P="Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n$Q\n\n### Response:\n"
+            echo "Q: $Q" | tee -a bench/supra-gguf.txt
+            "$R" -m "$M" -c 256 -n 48 -t 2 --temp 0.7 --top-k 50 --top-p 0.9 --repeat 1.15 --seed 1 -p "$P" 2>&1 | tee -a bench/supra-gguf.txt
+          done
+
+      - name: GGUF sampled benchmark Asena
+        run: |
+          R=llama.cpp/build-host/bin/llama-simple
+          M=asena-hf/gguf/asena_esp32max_q4_k_m.gguf
+          for Q in "Türkiye'nin başkenti neresi? Tek kelime cevap ver." '2+2 kaçtır? Kısa cevap ver.' 'Merhaba, nasılsın?'; do
+            P="Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n$Q\n\n### Response:\n"
+            echo "Q: $Q" | tee -a bench/asena-gguf.txt
+            "$R" -m "$M" -c 256 -n 48 -t 2 --temp 0.7 --top-k 50 --top-p 0.9 --repeat 1.15 --seed 1 -p "$P" 2>&1 | tee -a bench/asena-gguf.txt
+          done
+
+      - name: Save redistributable Supra candidate
+        run: |
+          sha256sum models/Supra-50M-Instruct.Q4_K_M.gguf > bench/supra-SHA256.txt
+          cat > bench/LICENSE-NOTE.txt <<'EOF'
+          Supra-50M-Instruct is Apache-2.0 according to its Hugging Face model card.
+          Asena_ESP32_MAX was benchmarked only. Its model file is intentionally NOT included in this artifact because its model card states a restrictive custom license.
+          EOF
+
+      - name: Upload benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-better-candidates
+          path: |
+            bench/
+            models/Supra-50M-Instruct.Q4_K_M.gguf
+          compression-level: 6
