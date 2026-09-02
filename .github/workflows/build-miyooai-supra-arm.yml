@@ -1,0 +1,350 @@
+name: build-miyooai-supra-arm
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-miyooai-supra-arm.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git wget xz-utils file
+
+      - name: Install Miyoo Buildroot toolchain
+        run: |
+          wget -q -O /tmp/miyoomini-toolchain.tar.xz \
+            https://github.com/shauninman/miyoomini-toolchain-buildroot/releases/download/v0.0.3/miyoomini-toolchain.tar.xz
+          sudo tar -C /opt -xf /tmp/miyoomini-toolchain.tar.xz
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-gcc --version
+
+      - name: Clone pinned llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin b81c99b479d4c24e5eeca10de99032ebd343ef8f
+          git -C llama.cpp checkout --detach FETCH_HEAD
+
+      - name: Install sampled low-memory runtime
+        run: |
+          cat > llama.cpp/examples/simple/simple.cpp <<'CPP'
+          #include "llama.h"
+          #include <algorithm>
+          #include <clocale>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <string>
+          #include <vector>
+
+          static void mem(const char * stage) {
+              FILE * f = std::fopen("/proc/self/status", "r");
+              if (!f) return;
+              char line[256];
+              std::fprintf(stderr, "[MEM] %s ", stage);
+              while (std::fgets(line, sizeof(line), f)) {
+                  if (!std::strncmp(line, "VmRSS:", 6) || !std::strncmp(line, "VmHWM:", 6) || !std::strncmp(line, "VmSize:", 7)) {
+                      char key[32] = {0}; long kb = 0;
+                      if (std::sscanf(line, "%31s %ld", key, &kb) == 2) std::fprintf(stderr, "%s=%ldKB ", key, kb);
+                  }
+              }
+              std::fprintf(stderr, "\n");
+              std::fclose(f);
+          }
+
+          int main(int argc, char ** argv) {
+              std::setlocale(LC_NUMERIC, "C");
+              std::string model, prompt;
+              int n_predict = 32, n_ctx = 128, threads = 2, top_k = 50;
+              float temp = 0.7f, top_p = 0.9f, repeat = 1.15f;
+              uint32_t seed = 1;
+
+              for (int i = 1; i < argc; ++i) {
+                  if (!std::strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
+                  else if (!std::strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
+                  else if (!std::strcmp(argv[i], "-n") && i + 1 < argc) n_predict = std::max(1, std::atoi(argv[++i]));
+                  else if (!std::strcmp(argv[i], "-c") && i + 1 < argc) n_ctx = std::max(32, std::atoi(argv[++i]));
+                  else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) threads = std::max(1, std::atoi(argv[++i]));
+                  else if (!std::strcmp(argv[i], "--temp") && i + 1 < argc) temp = std::atof(argv[++i]);
+                  else if (!std::strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = std::atoi(argv[++i]);
+                  else if (!std::strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = std::atof(argv[++i]);
+                  else if (!std::strcmp(argv[i], "--repeat") && i + 1 < argc) repeat = std::atof(argv[++i]);
+                  else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t) std::strtoul(argv[++i], nullptr, 10);
+              }
+              if (model.empty() || prompt.empty()) {
+                  std::fprintf(stderr, "usage: %s -m model.gguf -p prompt [-c 128] [-n 32] [-t 2]\n", argv[0]);
+                  return 2;
+              }
+
+              std::fprintf(stderr, "[MIYOOAI] ctx=%d predict=%d threads=%d temp=%.2f top_k=%d top_p=%.2f repeat=%.2f seed=%u\n",
+                           n_ctx, n_predict, threads, temp, top_k, top_p, repeat, seed);
+              mem("startup");
+
+              llama_model_params mp = llama_model_default_params();
+              mp.n_gpu_layers = 0;
+              const int64_t load0 = ggml_time_us();
+              llama_model * m = llama_model_load_from_file(model.c_str(), mp);
+              const int64_t load1 = ggml_time_us();
+              if (!m) { std::fprintf(stderr, "[ERROR] model load failed\n"); return 3; }
+              std::fprintf(stderr, "[MIYOOAI] model_load=%.3fs\n", (load1-load0)/1000000.0);
+              mem("after_model");
+
+              const llama_vocab * v = llama_model_get_vocab(m);
+              int np = -llama_tokenize(v, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
+              if (np <= 0 || np >= n_ctx) {
+                  std::fprintf(stderr, "[ERROR] prompt_tokens=%d ctx=%d\n", np, n_ctx);
+                  llama_model_free(m);
+                  return 4;
+              }
+              std::vector<llama_token> toks(np);
+              if (llama_tokenize(v, prompt.c_str(), prompt.size(), toks.data(), toks.size(), true, true) < 0) {
+                  llama_model_free(m); return 5;
+              }
+              n_predict = std::min(n_predict, n_ctx - np);
+              std::fprintf(stderr, "[MIYOOAI] prompt_tokens=%d effective_predict=%d\n", np, n_predict);
+
+              llama_context_params cp = llama_context_default_params();
+              cp.n_ctx = (uint32_t) n_ctx;
+              cp.n_batch = (uint32_t) std::min(np, n_ctx);
+              cp.no_perf = false;
+              llama_context * ctx = llama_init_from_model(m, cp);
+              if (!ctx) { llama_model_free(m); return 6; }
+              llama_set_n_threads(ctx, threads, threads);
+              mem("after_context");
+
+              auto sp = llama_sampler_chain_default_params();
+              sp.no_perf = false;
+              llama_sampler * sm = llama_sampler_chain_init(sp);
+              llama_sampler_chain_add(sm, llama_sampler_init_penalties(llama_vocab_n_tokens(v), 64, repeat, 0.0f, 0.0f));
+              llama_sampler_chain_add(sm, llama_sampler_init_top_k(top_k));
+              llama_sampler_chain_add(sm, llama_sampler_init_top_p(top_p, 1));
+              llama_sampler_chain_add(sm, llama_sampler_init_temp(temp));
+              llama_sampler_chain_add(sm, llama_sampler_init_dist(seed));
+
+              llama_batch batch = llama_batch_get_one(toks.data(), toks.size());
+              int generated = 0;
+              const int64_t gen0 = ggml_time_us();
+              while (generated < n_predict) {
+                  if (llama_decode(ctx, batch) != 0) { std::fprintf(stderr, "\n[ERROR] decode failed\n"); break; }
+                  llama_token id = llama_sampler_sample(sm, ctx, -1);
+                  llama_sampler_accept(sm, id);
+                  if (llama_vocab_is_eog(v, id)) break;
+                  char piece[512];
+                  int len = llama_token_to_piece(v, id, piece, sizeof(piece), 0, true);
+                  if (len < 0) break;
+                  std::fwrite(piece, 1, (size_t) len, stdout);
+                  std::fflush(stdout);
+                  batch = llama_batch_get_one(&id, 1);
+                  ++generated;
+              }
+              std::printf("\n");
+              const double sec = (ggml_time_us() - gen0) / 1000000.0;
+              std::fprintf(stderr, "[MIYOOAI] generated=%d generation_time=%.3fs speed=%.3f tok/s\n",
+                           generated, sec, sec > 0 ? generated/sec : 0.0);
+              mem("after_generate");
+              llama_perf_context_print(ctx);
+              llama_sampler_free(sm);
+              llama_free(ctx);
+              llama_model_free(m);
+              mem("shutdown");
+              return 0;
+          }
+          CPP
+
+          cat > llama.cpp/examples/simple/CMakeLists.txt <<'CMAKE'
+          set(TARGET llama-simple)
+          add_executable(${TARGET} simple.cpp)
+          install(TARGETS ${TARGET} RUNTIME)
+          target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+          target_compile_features(${TARGET} PRIVATE cxx_std_17)
+          CMAKE
+
+      - name: Cross compile sampled ARMv7 runtime
+        run: |
+          cat > miyoo-toolchain.cmake <<'EOF'
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR arm)
+          set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+          set(MIYOO_TC /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-)
+          set(CMAKE_C_COMPILER ${MIYOO_TC}gcc)
+          set(CMAKE_CXX_COMPILER ${MIYOO_TC}g++)
+          set(CMAKE_C_FLAGS_INIT "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections")
+          set(CMAKE_CXX_FLAGS_INIT "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections")
+          set(CMAKE_EXE_LINKER_FLAGS_INIT "-static-libgcc -static-libstdc++ -Wl,--gc-sections")
+          set(CMAKE_CXX_STANDARD_LIBRARIES "-lstdc++fs -lpthread")
+          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ARM_ARCH "armv7-a" CACHE STRING "" FORCE)
+          EOF
+          cmake -S llama.cpp -B llama.cpp/build-miyoo -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/miyoo-toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=OFF \
+            -DGGML_CPU_ARM_ARCH=armv7-a \
+            -DGGML_OPENMP=OFF -DGGML_BLAS=OFF -DGGML_LLAMAFILE=OFF -DGGML_CCACHE=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-miyoo --target llama-simple -j2
+          mkdir -p package/App/MiyooAI-Test/bin package/App/MiyooAI-Test/models package/App/MiyooAI-Test/logs info
+          cp llama.cpp/build-miyoo/bin/llama-simple package/App/MiyooAI-Test/bin/miyoo-infer
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-strip package/App/MiyooAI-Test/bin/miyoo-infer || true
+          file package/App/MiyooAI-Test/bin/miyoo-infer | tee info/runtime-file.txt
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-readelf -A package/App/MiyooAI-Test/bin/miyoo-infer | tee info/runtime-attributes.txt
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-readelf -d package/App/MiyooAI-Test/bin/miyoo-infer | tee info/runtime-dynamic.txt
+          ls -lh package/App/MiyooAI-Test/bin/miyoo-infer | tee info/runtime-size.txt
+
+      - name: Download validated Supra Q4 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MiyooAI-better-candidates
+          path: previous
+          github-token: ${{ github.token }}
+          run-id: 33639353620
+
+      - name: Install Supra Q4 model
+        run: |
+          cp previous/models/Supra-50M-Instruct.Q4_K_M.gguf package/App/MiyooAI-Test/models/
+          test -s package/App/MiyooAI-Test/models/Supra-50M-Instruct.Q4_K_M.gguf
+          ls -lh package/App/MiyooAI-Test/models/Supra-50M-Instruct.Q4_K_M.gguf | tee info/model-size.txt
+
+      - name: Build host runner for corrected prompt validation
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-host --target llama-simple -j2
+
+      - name: Validate Supra Q4 with real newlines
+        run: |
+          cat > prompt-paris.txt <<'EOF'
+          Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+          ### Instruction:
+          What is the capital of France? Answer with only the city.
+
+          ### Response:
+          EOF
+          PROMPT="$(cat prompt-paris.txt)"
+          llama.cpp/build-host/bin/llama-simple \
+            -m package/App/MiyooAI-Test/models/Supra-50M-Instruct.Q4_K_M.gguf \
+            -c 128 -n 32 -t 2 --temp 0.7 --top-k 50 --top-p 0.9 --repeat 1.15 --seed 1 \
+            -p "$PROMPT" > info/supra-q4-correct-prompt.txt 2>&1
+          cat info/supra-q4-correct-prompt.txt
+
+      - name: Write physical Miyoo test package
+        run: |
+          cat > package/App/MiyooAI-Test/prompt.txt <<'EOF'
+          Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+          ### Instruction:
+          What is the capital of France? Answer with only the city.
+
+          ### Response:
+          EOF
+
+          cat > package/App/MiyooAI-Test/launch.sh <<'EOF'
+          #!/bin/sh
+          DIR=$(cd -- "$(dirname "$0")" && pwd)
+          LOG="$DIR/logs/supra-miyoo.log"
+          mkdir -p "$DIR/logs"
+          PROMPT="$(cat "$DIR/prompt.txt")"
+          {
+            echo '=== MiyooAI Supra-50M Q4 physical test ==='
+            date 2>/dev/null || true
+            echo '--- free before ---'
+            free -k 2>/dev/null || true
+            echo '--- inference ---'
+            "$DIR/bin/miyoo-infer" \
+              -m "$DIR/models/Supra-50M-Instruct.Q4_K_M.gguf" \
+              -c 128 -n 32 -t 2 \
+              --temp 0.7 --top-k 50 --top-p 0.9 --repeat 1.15 --seed 1 \
+              -p "$PROMPT"
+            RC=$?
+            echo '--- free after ---'
+            free -k 2>/dev/null || true
+            echo "exit_code=$RC"
+          } > "$LOG" 2>&1
+          sync
+          exit $RC
+          EOF
+
+          cat > package/App/MiyooAI-Test/test-short.sh <<'EOF'
+          #!/bin/sh
+          DIR=$(cd -- "$(dirname "$0")" && pwd)
+          PROMPT="$(cat "$DIR/prompt.txt")"
+          exec "$DIR/bin/miyoo-infer" \
+            -m "$DIR/models/Supra-50M-Instruct.Q4_K_M.gguf" \
+            -c 96 -n 16 -t 2 \
+            --temp 0.7 --top-k 50 --top-p 0.9 --repeat 1.15 --seed 1 \
+            -p "$PROMPT"
+          EOF
+
+          cat > package/App/MiyooAI-Test/README.txt <<'EOF'
+          MiyooAI Supra-50M native ARMv7 proof-of-concept
+
+          This is a physical-device benchmark, not the final graphical app.
+
+          Target:
+            Miyoo Mini Plus / Cortex-A7 / ARMv7-A / NEON / hard-float / 128 MB RAM
+
+          Model:
+            SupraLabs/Supra-50M-Instruct Q4_K_M
+            Approx. 36 MB
+            Apache-2.0 model according to its model card.
+
+          Default test:
+            context 128
+            predict 32
+            threads 2
+            temperature 0.7
+            top-k 50
+            top-p 0.9
+            repetition penalty 1.15
+
+          Run launch.sh on the Miyoo.
+          Result is written to:
+            logs/supra-miyoo.log
+
+          Please return that log after the first physical test.
+          The key lines are:
+            [MEM] startup
+            [MEM] after_model
+            [MEM] after_context
+            [MEM] after_generate
+            [MIYOOAI] speed=... tok/s
+            exit_code=...
+
+          If the normal test is killed by the OOM killer, try test-short.sh once.
+          EOF
+
+          chmod +x package/App/MiyooAI-Test/launch.sh package/App/MiyooAI-Test/test-short.sh package/App/MiyooAI-Test/bin/miyoo-infer
+          sha256sum package/App/MiyooAI-Test/bin/miyoo-infer package/App/MiyooAI-Test/models/*.gguf | tee package/App/MiyooAI-Test/SHA256SUMS.txt
+          cp info/supra-q4-correct-prompt.txt package/App/MiyooAI-Test/HOST_VALIDATION.txt
+          find package/App/MiyooAI-Test -maxdepth 3 -type f -printf '%P %s bytes\n' | sort | tee info/package-files.txt
+
+      - name: Upload Miyoo physical test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-Supra50M-ARMv7-POC
+          path: package/
+          compression-level: 6
+
+      - name: Upload build info
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-Supra50M-build-info
+          path: info/
+          compression-level: 6
