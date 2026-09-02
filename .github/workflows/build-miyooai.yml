@@ -6,6 +6,7 @@ on:
       - '.github/workflows/build-miyooai.yml'
   workflow_dispatch:
 
+# Trigger revision 2
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -67,7 +68,6 @@ jobs:
           snapshot_download('SykoSLM/SykoLLM-V1.2-Turkish-Instruct', local_dir='syko-hf', allow_patterns=['*.json','*.txt','*.model','*.safetensors','merges.txt','vocab.json','tokenizer*'])
           PY
           python3 llama.cpp/convert_hf_to_gguf.py syko-hf --outfile out/models/syko-f16.gguf --outtype f16
-          # quantizer is target ARM, so build a host quantizer only for model preparation
           cmake -S llama.cpp -B llama.cpp/build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON
           cmake --build llama.cpp/build-host --target llama-quantize -j2
           llama.cpp/build-host/bin/llama-quantize out/models/syko-f16.gguf out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf Q4_K_M
