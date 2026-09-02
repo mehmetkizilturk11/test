@@ -6,7 +6,7 @@ on:
       - '.github/workflows/build-miyooai.yml'
   workflow_dispatch:
 
-# Trigger revision 4
+# Trigger revision 5
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -22,7 +22,7 @@ jobs:
       - name: Clone llama.cpp
         run: git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
 
-      - name: Cross compile unified llama for Miyoo ARMv7
+      - name: Cross compile unified llama app for Miyoo ARMv7
         run: |
           cat > armv7-toolchain.cmake <<'EOF'
           set(CMAKE_SYSTEM_NAME Linux)
@@ -45,7 +45,7 @@ jobs:
             -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=ON
-          cmake --build llama.cpp/build-miyoo --target llama -j2
+          cmake --build llama.cpp/build-miyoo --target llama-app -j2
           mkdir -p out/bin out/models out/info
           cp llama.cpp/build-miyoo/bin/llama out/bin/
           arm-linux-gnueabihf-strip out/bin/llama || true
@@ -76,7 +76,7 @@ jobs:
             -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=ON
-          cmake --build llama.cpp/build-host --target llama -j2
+          cmake --build llama.cpp/build-host --target llama-app -j2
           llama.cpp/build-host/bin/llama quantize out/models/syko-f16.gguf out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf Q4_K_M
           rm out/models/syko-f16.gguf
 
@@ -84,7 +84,6 @@ jobs:
         run: |
           set -x
           llama.cpp/build-host/bin/llama bench -m out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf -p 8 -n 8 -t 1 | tee out/info/syko-host-bench.txt
-          # Build a host llama already exists; use a short load/bench check for Stentor too.
           llama.cpp/build-host/bin/llama bench -m out/models/Stentor-30M-Instruct.Q4_K_M.gguf -p 8 -n 8 -t 1 | tee out/info/stentor-host-bench.txt
 
       - name: Write Miyoo benchmark scripts
@@ -133,11 +132,10 @@ jobs:
           - SykoLLM-V1.2-Turkish-Instruct Q4_K_M
 
           First test over SSH:
-            cd /path/to/MiyooAI
             ./bench-stentor.sh
             ./bench-syko.sh
 
-          If both survive without OOM, try:
+          If both survive without OOM:
             ./chat-stentor.sh
             ./chat-syko.sh
 
