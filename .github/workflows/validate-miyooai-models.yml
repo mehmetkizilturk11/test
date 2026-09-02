@@ -1,0 +1,151 @@
+name: validate-miyooai-models
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/validate-miyooai-models.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git python3 python3-pip
+          python3 -m pip install --break-system-packages --upgrade numpy sentencepiece transformers safetensors protobuf 'huggingface_hub[hf_xet]'
+          python3 -m pip install --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Download previous Miyoo package
+        uses: actions/download-artifact@v4
+        with:
+          name: MiyooAI-native-Stentor30M-Syko51M
+          path: previous
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 33636473744
+
+      - name: Clone pinned llama.cpp and patch Syko tokenizer
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin b81c99b479d4c24e5eeca10de99032ebd343ef8f
+          git -C llama.cpp checkout --detach FETCH_HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('llama.cpp/conversion/base.py')
+          s=p.read_text()
+          needle='        if res is None:\n'
+          patch='        if chkhsh == "25877d97615bcc3ffed80d36fa2e2b1250fc4b9fceb1f8fcdd01997232d4e8c3":\n            res = "gpt-2"\n\n'
+          assert needle in s
+          p.write_text(s.replace(needle, patch+needle,1))
+          PY
+
+      - name: Download official HF checkpoints
+        run: |
+          hf download StentorLabs/Stentor-30M-Instruct --local-dir stentor-official
+          hf download SykoSLM/SykoLLM-V1.2-Turkish-Instruct --local-dir syko-official
+          mkdir -p validation
+
+      - name: Run original HF inference and record exact prompts
+        run: |
+          python3 - <<'PY' 2>&1 | tee validation/hf-reference.txt
+          import torch
+          from transformers import AutoTokenizer, AutoModelForCausalLM
+
+          def test_stentor():
+              path='stentor-official'
+              tok=AutoTokenizer.from_pretrained(path)
+              model=AutoModelForCausalLM.from_pretrained(path).eval()
+              messages=[
+                  {'role':'system','content':'You are a helpful assistant.'},
+                  {'role':'user','content':'What is the capital of France? Answer briefly.'},
+              ]
+              prompt=tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+              open('validation/stentor-prompt.txt','w').write(prompt)
+              ids=tok(prompt, return_tensors='pt').input_ids
+              with torch.no_grad():
+                  out=model.generate(ids, max_new_tokens=32, do_sample=False, pad_token_id=tok.eos_token_id)
+              new=out[0,ids.shape[1]:]
+              print('=== STENTOR ===')
+              print('PROMPT_REPR',repr(prompt))
+              print('PROMPT_IDS',ids[0].tolist())
+              print('GREEDY_NEW_IDS',new.tolist())
+              print('GREEDY_NEW_TEXT',repr(tok.decode(new,skip_special_tokens=False)))
+
+              torch.manual_seed(1)
+              with torch.no_grad():
+                  out2=model.generate(ids,max_new_tokens=32,do_sample=True,temperature=1.1,top_p=0.6,repetition_penalty=1.3,pad_token_id=tok.eos_token_id)
+              new2=out2[0,ids.shape[1]:]
+              print('SAMPLED_NEW_TEXT',repr(tok.decode(new2,skip_special_tokens=False)))
+              del model
+
+          def test_syko():
+              path='syko-official'
+              tok=AutoTokenizer.from_pretrained(path)
+              model=AutoModelForCausalLM.from_pretrained(path).eval()
+              prompt='<user> Türkiye nin başkenti neresidir? Kısa cevap ver.<assistant>'
+              open('validation/syko-prompt.txt','w').write(prompt)
+              ids=tok(prompt,return_tensors='pt').input_ids
+              with torch.no_grad():
+                  out=model.generate(ids,max_new_tokens=32,do_sample=False,pad_token_id=tok.eos_token_id)
+              new=out[0,ids.shape[1]:]
+              print('=== SYKO ===')
+              print('PROMPT_REPR',repr(prompt))
+              print('PROMPT_IDS',ids[0].tolist())
+              print('GREEDY_NEW_IDS',new.tolist())
+              print('GREEDY_NEW_TEXT',repr(tok.decode(new,skip_special_tokens=False)))
+              torch.manual_seed(1)
+              with torch.no_grad():
+                  out2=model.generate(ids,max_new_tokens=32,do_sample=True,temperature=0.8,top_p=0.9,pad_token_id=tok.eos_token_id)
+              new2=out2[0,ids.shape[1]:]
+              print('SAMPLED_NEW_TEXT',repr(tok.decode(new2,skip_special_tokens=False)))
+
+          test_stentor()
+          test_syko()
+          PY
+
+      - name: Convert official Stentor and Syko to F16 GGUF
+        run: |
+          python3 llama.cpp/convert_hf_to_gguf.py stentor-official --outfile validation/Stentor-official.F16.gguf --outtype f16 2>&1 | tee validation/stentor-convert.txt
+          python3 llama.cpp/convert_hf_to_gguf.py syko-official --outfile validation/Syko-official.F16.gguf --outtype f16 2>&1 | tee validation/syko-convert.txt
+
+      - name: Build host quantizer and simple runtime
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-host --target llama-quantize llama-simple -j2
+
+      - name: Quantize official models Q4_K_M
+        run: |
+          llama.cpp/build-host/bin/llama-quantize validation/Stentor-official.F16.gguf validation/Stentor-official.Q4_K_M.gguf Q4_K_M 2>&1 | tee validation/stentor-quant.txt
+          llama.cpp/build-host/bin/llama-quantize validation/Syko-official.F16.gguf validation/Syko-official.Q4_K_M.gguf Q4_K_M 2>&1 | tee validation/syko-quant.txt
+          rm validation/*F16.gguf
+          ls -lh validation/*Q4_K_M.gguf | tee validation/official-q4-sizes.txt
+
+      - name: Test official-converted Q4 and previous Q4
+        run: |
+          set -o pipefail
+          STP=$(cat validation/stentor-prompt.txt)
+          SYP=$(cat validation/syko-prompt.txt)
+          echo '=== OFFICIAL STENTOR Q4 ===' | tee validation/gguf-tests.txt
+          llama.cpp/build-host/bin/llama-simple -m validation/Stentor-official.Q4_K_M.gguf -n 32 -ngl 0 "$STP" 2>&1 | tee -a validation/gguf-tests.txt
+          echo '=== PREVIOUS STENTOR Q4 ===' | tee -a validation/gguf-tests.txt
+          llama.cpp/build-host/bin/llama-simple -m previous/models/Stentor-30M-Instruct.Q4_K_M.gguf -n 32 -ngl 0 "$STP" 2>&1 | tee -a validation/gguf-tests.txt
+          echo '=== OFFICIAL SYKO Q4 ===' | tee -a validation/gguf-tests.txt
+          llama.cpp/build-host/bin/llama-simple -m validation/Syko-official.Q4_K_M.gguf -n 32 -ngl 0 "$SYP" 2>&1 | tee -a validation/gguf-tests.txt
+          echo '=== PREVIOUS SYKO Q4 ===' | tee -a validation/gguf-tests.txt
+          llama.cpp/build-host/bin/llama-simple -m previous/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf -n 32 -ngl 0 "$SYP" 2>&1 | tee -a validation/gguf-tests.txt
+
+      - name: Package official Q4 validation artifacts
+        run: |
+          sha256sum validation/*Q4_K_M.gguf > validation/SHA256SUMS.txt
+
+      - name: Upload validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-model-validation
+          path: validation/
+          compression-level: 6
