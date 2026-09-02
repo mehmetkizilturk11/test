@@ -1,0 +1,265 @@
+name: build-miyooai-release-v2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-miyooai-release-v2.yml'
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build wget file git git-lfs xz-utils python3 python3-pip
+          git lfs install
+          python3 -m pip install --break-system-packages --upgrade numpy sentencepiece transformers safetensors protobuf 'huggingface_hub[hf_xet]'
+          python3 -m pip install --break-system-packages --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Install Miyoo Mini Buildroot toolchain
+        run: |
+          wget -q -O /tmp/miyoomini-toolchain.tar.xz https://github.com/shauninman/miyoomini-toolchain-buildroot/releases/download/v0.0.3/miyoomini-toolchain.tar.xz
+          sudo tar -C /opt -xf /tmp/miyoomini-toolchain.tar.xz
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-gcc --version
+
+      - name: Clone pinned llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin b81c99b479d4c24e5eeca10de99032ebd343ef8f
+          git -C llama.cpp checkout --detach FETCH_HEAD
+          echo b81c99b479d4c24e5eeca10de99032ebd343ef8f > llama-commit.txt
+
+      - name: Install minimal inference runtime
+        run: |
+          cat > llama.cpp/examples/simple/simple.cpp <<'CPP'
+          #include "llama.h"
+          #include <algorithm>
+          #include <clocale>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <string>
+          #include <vector>
+
+          static void mem(const char * stage) {
+              FILE * f = std::fopen("/proc/self/status", "r");
+              if (!f) return;
+              char line[256];
+              std::fprintf(stderr, "[MEM] %s ", stage);
+              while (std::fgets(line, sizeof(line), f)) {
+                  if (!std::strncmp(line,"VmRSS:",6) || !std::strncmp(line,"VmHWM:",6) || !std::strncmp(line,"VmSize:",7)) {
+                      char k[32]={0}; long v=0;
+                      if (std::sscanf(line,"%31s %ld",k,&v)==2) std::fprintf(stderr,"%s=%ldKB ",k,v);
+                  }
+              }
+              std::fprintf(stderr,"\n");
+              std::fclose(f);
+          }
+
+          int main(int argc, char ** argv) {
+              std::setlocale(LC_NUMERIC,"C");
+              std::string model, prompt;
+              int ctx_n=128, pred_n=32, threads=2;
+              for (int i=1;i<argc;i++) {
+                  if (!std::strcmp(argv[i],"-m") && i+1<argc) model=argv[++i];
+                  else if (!std::strcmp(argv[i],"-c") && i+1<argc) ctx_n=std::max(32,std::atoi(argv[++i]));
+                  else if (!std::strcmp(argv[i],"-n") && i+1<argc) pred_n=std::max(1,std::atoi(argv[++i]));
+                  else if (!std::strcmp(argv[i],"-t") && i+1<argc) threads=std::max(1,std::atoi(argv[++i]));
+                  else if (!std::strcmp(argv[i],"-p") && i+1<argc) prompt=argv[++i];
+                  else { if (!prompt.empty()) prompt += " "; prompt += argv[i]; }
+              }
+              if (model.empty() || prompt.empty()) {
+                  std::fprintf(stderr,"usage: %s -m model.gguf [-c 128] [-n 32] [-t 2] -p prompt\n",argv[0]);
+                  return 2;
+              }
+
+              std::fprintf(stderr,"[MIYOOAI] ctx=%d predict=%d threads=%d\n",ctx_n,pred_n,threads);
+              mem("startup");
+
+              llama_model_params mp=llama_model_default_params();
+              mp.n_gpu_layers=0;
+              const int64_t load0=ggml_time_us();
+              llama_model * m=llama_model_load_from_file(model.c_str(),mp);
+              const int64_t load1=ggml_time_us();
+              if (!m) { std::fprintf(stderr,"[ERROR] model load failed\n"); return 3; }
+              std::fprintf(stderr,"[MIYOOAI] model_load=%.3fs\n",(load1-load0)/1000000.0);
+              mem("after_model");
+
+              const llama_vocab * vocab=llama_model_get_vocab(m);
+              int np=-llama_tokenize(vocab,prompt.c_str(),prompt.size(),nullptr,0,true,true);
+              if (np<=0 || np>=ctx_n) { std::fprintf(stderr,"[ERROR] prompt tokens=%d ctx=%d\n",np,ctx_n); llama_model_free(m); return 4; }
+              std::vector<llama_token> toks(np);
+              if (llama_tokenize(vocab,prompt.c_str(),prompt.size(),toks.data(),toks.size(),true,true)<0) { llama_model_free(m); return 5; }
+              pred_n=std::min(pred_n,ctx_n-np);
+              std::fprintf(stderr,"[MIYOOAI] prompt_tokens=%d effective_predict=%d\n",np,pred_n);
+
+              llama_context_params cp=llama_context_default_params();
+              cp.n_ctx=(uint32_t)ctx_n;
+              cp.n_batch=(uint32_t)np;
+              cp.no_perf=false;
+              llama_context * ctx=llama_init_from_model(m,cp);
+              if (!ctx) { std::fprintf(stderr,"[ERROR] context creation failed\n"); llama_model_free(m); return 6; }
+              llama_set_n_threads(ctx,threads,threads);
+              mem("after_context");
+
+              auto sp=llama_sampler_chain_default_params();
+              sp.no_perf=false;
+              llama_sampler * sm=llama_sampler_chain_init(sp);
+              llama_sampler_chain_add(sm,llama_sampler_init_greedy());
+              llama_batch batch=llama_batch_get_one(toks.data(),toks.size());
+              int generated=0;
+              const int64_t gen0=ggml_time_us();
+              while (generated<pred_n) {
+                  if (llama_decode(ctx,batch)!=0) { std::fprintf(stderr,"\n[ERROR] decode failed\n"); break; }
+                  llama_token id=llama_sampler_sample(sm,ctx,-1);
+                  if (llama_vocab_is_eog(vocab,id)) break;
+                  char piece[512];
+                  int len=llama_token_to_piece(vocab,id,piece,sizeof(piece),0,true);
+                  if (len<0) break;
+                  std::fwrite(piece,1,(size_t)len,stdout); std::fflush(stdout);
+                  batch=llama_batch_get_one(&id,1);
+                  generated++;
+              }
+              std::printf("\n");
+              const int64_t gen1=ggml_time_us();
+              double sec=(gen1-gen0)/1000000.0;
+              std::fprintf(stderr,"[MIYOOAI] generated=%d generation_time=%.3fs speed=%.3f tok/s\n",generated,sec,sec>0?generated/sec:0.0);
+              mem("after_generate");
+              llama_perf_context_print(ctx);
+              llama_sampler_free(sm); llama_free(ctx); llama_model_free(m);
+              mem("shutdown");
+              return 0;
+          }
+          CPP
+          cat > llama.cpp/examples/simple/CMakeLists.txt <<'CMAKE'
+          set(TARGET llama-simple)
+          add_executable(${TARGET} simple.cpp)
+          install(TARGETS ${TARGET} RUNTIME)
+          target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+          target_compile_features(${TARGET} PRIVATE cxx_std_17)
+          CMAKE
+
+      - name: Cross compile native Miyoo runtime
+        run: |
+          cat > miyoo-toolchain.cmake <<'EOF'
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR arm)
+          set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+          set(MIYOO_TC /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-)
+          set(CMAKE_C_COMPILER ${MIYOO_TC}gcc)
+          set(CMAKE_CXX_COMPILER ${MIYOO_TC}g++)
+          set(CMAKE_C_FLAGS_INIT "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections")
+          set(CMAKE_CXX_FLAGS_INIT "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections")
+          set(CMAKE_EXE_LINKER_FLAGS_INIT "-static-libgcc -static-libstdc++ -Wl,--gc-sections")
+          set(CMAKE_CXX_STANDARD_LIBRARIES "-lstdc++fs -lpthread")
+          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ARM_ARCH "armv7-a" CACHE STRING "" FORCE)
+          EOF
+          cmake -S llama.cpp -B llama.cpp/build-miyoo -G Ninja -DCMAKE_TOOLCHAIN_FILE="$PWD/miyoo-toolchain.cmake" -DCMAKE_BUILD_TYPE=MinSizeRel -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=OFF -DGGML_CPU_ARM_ARCH=armv7-a -DGGML_OPENMP=OFF -DGGML_BLAS=OFF -DGGML_LLAMAFILE=OFF -DGGML_CCACHE=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-miyoo --target llama-simple -j2
+          mkdir -p out/bin out/models out/info
+          cp llama.cpp/build-miyoo/bin/llama-simple out/bin/miyoo-infer
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-strip out/bin/miyoo-infer || true
+          file out/bin/miyoo-infer | tee out/info/runtime-file.txt
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-readelf -A out/bin/miyoo-infer | tee out/info/runtime-attributes.txt
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-readelf -d out/bin/miyoo-infer | tee out/info/runtime-dynamic.txt
+          ls -lh out/bin/miyoo-infer | tee out/info/runtime-size.txt
+
+      - name: Download Stentor Q4_K_M
+        run: |
+          hf download mradermacher/Stentor-30M-Instruct-GGUF --include '*Q4_K_M.gguf' --local-dir stentor-hf
+          STENTOR=$(find stentor-hf -type f -name '*Q4_K_M.gguf' | head -n1)
+          test -n "$STENTOR"
+          cp "$STENTOR" out/models/Stentor-30M-Instruct.Q4_K_M.gguf
+          ls -lh out/models/Stentor-30M-Instruct.Q4_K_M.gguf
+
+      - name: Download Syko Turkish model
+        run: |
+          hf download SykoSLM/SykoLLM-V1.2-Turkish-Instruct --local-dir syko-hf
+          test -s syko-hf/config.json
+          test -s syko-hf/model.safetensors
+          cat syko-hf/config.json | tee out/info/syko-config.json
+
+      - name: Convert Syko GPT2 to GGUF F16
+        run: |
+          python3 llama.cpp/convert_hf_to_gguf.py syko-hf --outfile out/models/Syko.F16.gguf --outtype f16
+          test -s out/models/Syko.F16.gguf
+          ls -lh out/models/Syko.F16.gguf
+
+      - name: Build host quantizer and test runtime
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-host --target llama-quantize llama-simple -j2
+
+      - name: Quantize Syko Q4_K_M
+        run: |
+          llama.cpp/build-host/bin/llama-quantize out/models/Syko.F16.gguf out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf Q4_K_M
+          rm out/models/Syko.F16.gguf
+          ls -lh out/models/*.gguf | tee out/info/model-sizes.txt
+
+      - name: Host sanity tests
+        run: |
+          set -o pipefail
+          llama.cpp/build-host/bin/llama-simple -m out/models/Stentor-30M-Instruct.Q4_K_M.gguf -c 128 -n 16 -t 1 -p '[INST] What is the capital of France? Answer briefly.[/INST]' 2>&1 | tee out/info/stentor-host-test.txt
+          llama.cpp/build-host/bin/llama-simple -m out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf -c 128 -n 16 -t 1 -p '<user> Türkiye nin başkenti neresidir? Kısa cevap ver.<assistant>' 2>&1 | tee out/info/syko-host-test.txt
+
+      - name: Write Miyoo test scripts
+        run: |
+          cat > out/test-stentor.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); L="$D/stentor-miyoo.log"
+          echo '=== Stentor 30M Q4_K_M ===' > "$L"; free -k >> "$L" 2>&1 || true
+          "$D/bin/miyoo-infer" -m "$D/models/Stentor-30M-Instruct.Q4_K_M.gguf" -c 128 -n 32 -t 2 -p '[INST] What is the capital of France? Answer briefly.[/INST]' >> "$L" 2>&1
+          R=$?; free -k >> "$L" 2>&1 || true; echo exit_code=$R >> "$L"; cat "$L"; exit $R
+          EOF
+          cat > out/test-syko.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); L="$D/syko-miyoo.log"
+          echo '=== Syko Turkish 51M Q4_K_M ===' > "$L"; free -k >> "$L" 2>&1 || true
+          "$D/bin/miyoo-infer" -m "$D/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -c 128 -n 32 -t 2 -p '<user> Türkiye nin başkenti neresidir? Kısa cevap ver.<assistant>' >> "$L" 2>&1
+          R=$?; free -k >> "$L" 2>&1 || true; echo exit_code=$R >> "$L"; cat "$L"; exit $R
+          EOF
+          cat > out/ask-stentor.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); Q="$*"; [ -n "$Q" ] || Q='Hello, introduce yourself briefly.'
+          exec "$D/bin/miyoo-infer" -m "$D/models/Stentor-30M-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 -p "[INST] $Q[/INST]"
+          EOF
+          cat > out/ask-syko.sh <<'EOF'
+          #!/bin/sh
+          D=$(cd -- "$(dirname "$0")" && pwd); Q="$*"; [ -n "$Q" ] || Q='Selam, kendini kısaca tanıtır mısın?'
+          exec "$D/bin/miyoo-infer" -m "$D/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 -p "<user> $Q<assistant>"
+          EOF
+          chmod +x out/*.sh out/bin/miyoo-infer
+          cp llama-commit.txt out/info/
+          cat > out/README.txt <<'EOF'
+          MiyooAI native/offline proof of concept
+          Target: Miyoo Mini Plus / OnionOS / Cortex-A7 ARMv7-A / 128 MB RAM
+          First test: run ./test-stentor.sh, then ./test-syko.sh.
+          Send back stentor-miyoo.log and syko-miyoo.log.
+          Initial limits are intentionally conservative: context 128, output 32, threads 2.
+          EOF
+          sha256sum out/bin/miyoo-infer out/models/*.gguf | tee out/info/SHA256SUMS.txt
+          du -h out/bin/miyoo-infer out/models/*.gguf | tee out/info/final-sizes.txt
+
+      - name: Upload release
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-native-Stentor30M-Syko51M
+          path: out/
+          compression-level: 6
+
+      - name: Upload failure info
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-release-v2-failure
+          path: |
+            out/
+            syko-hf/config.json
+          if-no-files-found: ignore
