@@ -6,34 +6,47 @@ on:
       - '.github/workflows/build-miyooai.yml'
   workflow_dispatch:
 
-# Trigger revision 5
+# Trigger revision 6 - real Miyoo Buildroot toolchain + robust HF download
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install host dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build python3 python3-pip curl file
+          sudo apt-get install -y cmake ninja-build python3 python3-pip curl wget file git git-lfs xz-utils
+          git lfs install
           python3 -m pip install --break-system-packages --upgrade huggingface_hub numpy sentencepiece transformers safetensors
+
+      - name: Install Miyoo Mini Buildroot toolchain
+        run: |
+          wget -q --show-progress -O /tmp/miyoomini-toolchain.tar.xz \
+            https://github.com/shauninman/miyoomini-toolchain-buildroot/releases/download/v0.0.3/miyoomini-toolchain.tar.xz
+          sudo tar -C /opt -xf /tmp/miyoomini-toolchain.tar.xz
+          TC=/opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-
+          "$TC"gcc --version
+          "$TC"gcc --print-sysroot
+          "$TC"g++ --version
 
       - name: Clone llama.cpp
         run: git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
 
-      - name: Cross compile unified llama app for Miyoo ARMv7
+      - name: Cross compile unified llama app for Miyoo Cortex-A7
         run: |
-          cat > armv7-toolchain.cmake <<'EOF'
+          cat > miyoo-toolchain.cmake <<'EOF'
           set(CMAKE_SYSTEM_NAME Linux)
           set(CMAKE_SYSTEM_PROCESSOR arm)
-          set(CMAKE_C_COMPILER arm-linux-gnueabihf-gcc)
-          set(CMAKE_CXX_COMPILER arm-linux-gnueabihf-g++)
+          set(MIYOO_TC /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-)
+          set(CMAKE_C_COMPILER ${MIYOO_TC}gcc)
+          set(CMAKE_CXX_COMPILER ${MIYOO_TC}g++)
           set(CMAKE_C_FLAGS "-mfpu=neon-vfpv4 -mfloat-abi=hard -O2")
           set(CMAKE_CXX_FLAGS "-mfpu=neon-vfpv4 -mfloat-abi=hard -O2")
+          set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++")
           EOF
           cmake -S llama.cpp -B llama.cpp/build-miyoo -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/armv7-toolchain.cmake" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/miyoo-toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_NATIVE=OFF \
@@ -48,10 +61,10 @@ jobs:
           cmake --build llama.cpp/build-miyoo --target llama-app -j2
           mkdir -p out/bin out/models out/info
           cp llama.cpp/build-miyoo/bin/llama out/bin/
-          arm-linux-gnueabihf-strip out/bin/llama || true
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-strip out/bin/llama || true
           file out/bin/llama | tee out/info/file.txt
-          arm-linux-gnueabihf-readelf -A out/bin/llama | tee out/info/attributes.txt
-          arm-linux-gnueabihf-readelf -d out/bin/llama | tee out/info/dynamic.txt
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-readelf -A out/bin/llama | tee out/info/attributes.txt
+          /opt/miyoomini-toolchain/usr/bin/arm-linux-gnueabihf-readelf -d out/bin/llama | tee out/info/dynamic.txt
 
       - name: Download Stentor Q4_K_M
         run: |
@@ -61,13 +74,25 @@ jobs:
           print(p)
           PY
 
-      - name: Convert and quantize Syko Turkish GPT-2
+      - name: Download Syko Turkish model with Git LFS
+        env:
+          GIT_LFS_SKIP_SMUDGE: "0"
         run: |
-          python3 - <<'PY'
-          from huggingface_hub import snapshot_download
-          snapshot_download('SykoSLM/SykoLLM-V1.2-Turkish-Instruct', local_dir='syko-hf', allow_patterns=['*.json','*.txt','*.model','*.safetensors','merges.txt','vocab.json','tokenizer*'])
-          PY
+          rm -rf syko-hf
+          git clone --depth 1 https://huggingface.co/SykoSLM/SykoLLM-V1.2-Turkish-Instruct syko-hf
+          test -s syko-hf/model.safetensors
+          SIZE=$(stat -c %s syko-hf/model.safetensors)
+          echo "Syko model.safetensors bytes=$SIZE"
+          test "$SIZE" -gt 100000000
+          ls -lh syko-hf | tee out/info/syko-hf-files.txt
+
+      - name: Convert Syko to GGUF
+        run: |
           python3 llama.cpp/convert_hf_to_gguf.py syko-hf --outfile out/models/syko-f16.gguf --outtype f16
+          ls -lh out/models/syko-f16.gguf
+
+      - name: Build host llama app and quantize Syko
+        run: |
           cmake -S llama.cpp -B llama.cpp/build-host -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
@@ -77,16 +102,18 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=ON
           cmake --build llama.cpp/build-host --target llama-app -j2
-          llama.cpp/build-host/bin/llama quantize out/models/syko-f16.gguf out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf Q4_K_M
+          llama.cpp/build-host/bin/llama quantize \
+            out/models/syko-f16.gguf \
+            out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf \
+            Q4_K_M
           rm out/models/syko-f16.gguf
 
-      - name: Sanity check models on x86 host
+      - name: Sanity check both models on x86 host
         run: |
-          set -x
           llama.cpp/build-host/bin/llama bench -m out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf -p 8 -n 8 -t 1 | tee out/info/syko-host-bench.txt
           llama.cpp/build-host/bin/llama bench -m out/models/Stentor-30M-Instruct.Q4_K_M.gguf -p 8 -n 8 -t 1 | tee out/info/stentor-host-bench.txt
 
-      - name: Write Miyoo benchmark scripts
+      - name: Write Miyoo benchmark and chat scripts
         run: |
           cat > out/bench-stentor.sh <<'EOF'
           #!/bin/sh
@@ -97,8 +124,9 @@ jobs:
           date 2>/dev/null | tee -a "$LOG" || true
           free -m 2>/dev/null | tee -a "$LOG" || true
           "$DIR/bin/llama" bench -m "$DIR/models/Stentor-30M-Instruct.Q4_K_M.gguf" -p 16 -n 32 -t 2 2>&1 | tee -a "$LOG"
+          RC=${PIPESTATUS:-0}
           free -m 2>/dev/null | tee -a "$LOG" || true
-          echo "=== end ===" | tee -a "$LOG"
+          echo "=== end rc=$RC ===" | tee -a "$LOG"
           EOF
           cat > out/bench-syko.sh <<'EOF'
           #!/bin/sh
@@ -109,8 +137,9 @@ jobs:
           date 2>/dev/null | tee -a "$LOG" || true
           free -m 2>/dev/null | tee -a "$LOG" || true
           "$DIR/bin/llama" bench -m "$DIR/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -p 16 -n 32 -t 2 2>&1 | tee -a "$LOG"
+          RC=${PIPESTATUS:-0}
           free -m 2>/dev/null | tee -a "$LOG" || true
-          echo "=== end ===" | tee -a "$LOG"
+          echo "=== end rc=$RC ===" | tee -a "$LOG"
           EOF
           cat > out/chat-stentor.sh <<'EOF'
           #!/bin/sh
@@ -126,12 +155,15 @@ jobs:
           cat > out/README.txt <<'EOF'
           MiyooAI ARMv7 benchmark package
 
-          Target: Miyoo Mini Plus / Cortex-A7 / ARMv7-A hard-float + NEON/VFPv4.
-          Models:
-          - Stentor-30M-Instruct Q4_K_M
-          - SykoLLM-V1.2-Turkish-Instruct Q4_K_M
+          Target: Miyoo Mini Plus / OnionOS / Cortex-A7 / ARMv7-A hard-float + NEON/VFPv4.
+          Runtime is compiled with the Miyoo Mini Buildroot toolchain v0.0.3.
 
-          First test over SSH:
+          Models:
+          - Stentor-30M-Instruct Q4_K_M (English/general)
+          - SykoLLM-V1.2-Turkish-Instruct Q4_K_M (Turkish)
+
+          FIRST TEST OVER SSH:
+            chmod +x bin/llama *.sh
             ./bench-stentor.sh
             ./bench-syko.sh
 
@@ -139,8 +171,8 @@ jobs:
             ./chat-stentor.sh
             ./chat-syko.sh
 
-          Context is intentionally 128 tokens for the first physical-device test.
-          Logs are saved beside the scripts.
+          Context is intentionally limited to 128 tokens for the first physical-device test.
+          Send stentor-miyoo.log and syko-miyoo.log back for RAM/speed tuning.
           EOF
           du -h out/models/* | tee out/info/model-sizes.txt
           sha256sum out/bin/llama out/models/*.gguf | tee out/info/SHA256SUMS.txt
