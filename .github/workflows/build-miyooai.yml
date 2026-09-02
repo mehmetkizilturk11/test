@@ -1,0 +1,102 @@
+name: build-miyooai
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-miyooai.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build python3 python3-pip curl file
+          python3 -m pip install --break-system-packages --upgrade huggingface_hub numpy sentencepiece transformers safetensors
+
+      - name: Clone llama.cpp
+        run: git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+
+      - name: Cross compile llama.cpp for Miyoo ARMv7
+        run: |
+          cat > armv7-toolchain.cmake <<'EOF'
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR arm)
+          set(CMAKE_C_COMPILER arm-linux-gnueabihf-gcc)
+          set(CMAKE_CXX_COMPILER arm-linux-gnueabihf-g++)
+          set(CMAKE_C_FLAGS "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -O2")
+          set(CMAKE_CXX_FLAGS "-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -O2")
+          EOF
+          cmake -S llama.cpp -B llama.cpp/build-miyoo -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/armv7-toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_BLAS=OFF \
+            -DGGML_LLAMAFILE=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-miyoo --target llama-cli llama-bench llama-quantize -j2
+          mkdir -p out/bin out/models out/info
+          cp llama.cpp/build-miyoo/bin/llama-cli out/bin/
+          cp llama.cpp/build-miyoo/bin/llama-bench out/bin/
+          cp llama.cpp/build-miyoo/bin/llama-quantize out/bin/ || true
+          arm-linux-gnueabihf-strip out/bin/llama-cli out/bin/llama-bench || true
+          file out/bin/* | tee out/info/file.txt
+          arm-linux-gnueabihf-readelf -d out/bin/llama-cli | tee out/info/dynamic.txt
+
+      - name: Download Stentor Q4_K_M
+        run: |
+          python3 - <<'PY'
+          from huggingface_hub import hf_hub_download
+          p=hf_hub_download('mradermacher/Stentor-30M-Instruct-GGUF', filename='Stentor-30M-Instruct.Q4_K_M.gguf', local_dir='out/models')
+          print(p)
+          PY
+
+      - name: Convert and quantize Syko Turkish GPT-2
+        run: |
+          python3 - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download('SykoSLM/SykoLLM-V1.2-Turkish-Instruct', local_dir='syko-hf', allow_patterns=['*.json','*.txt','*.model','*.safetensors','merges.txt','vocab.json','tokenizer*'])
+          PY
+          python3 llama.cpp/convert_hf_to_gguf.py syko-hf --outfile out/models/syko-f16.gguf --outtype f16
+          # quantizer is target ARM, so build a host quantizer only for model preparation
+          cmake -S llama.cpp -B llama.cpp/build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON
+          cmake --build llama.cpp/build-host --target llama-quantize -j2
+          llama.cpp/build-host/bin/llama-quantize out/models/syko-f16.gguf out/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf Q4_K_M
+          rm out/models/syko-f16.gguf
+
+      - name: Write Miyoo benchmark scripts
+        run: |
+          cat > out/bench-stentor.sh <<'EOF'
+          #!/bin/sh
+          DIR=$(cd -- "$(dirname "$0")" && pwd)
+          /usr/bin/time -v "$DIR/bin/llama-cli" -m "$DIR/models/Stentor-30M-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 --no-display-prompt -p "User: What is the capital of France?\nAssistant:"
+          EOF
+          cat > out/bench-syko.sh <<'EOF'
+          #!/bin/sh
+          DIR=$(cd -- "$(dirname "$0")" && pwd)
+          /usr/bin/time -v "$DIR/bin/llama-cli" -m "$DIR/models/SykoLLM-V1.2-Turkish-Instruct.Q4_K_M.gguf" -c 128 -n 48 -t 2 --no-display-prompt -p "<user> Türkiye'nin başkenti neresidir?<assistant>"
+          EOF
+          chmod +x out/*.sh
+          cat > out/README.txt <<'EOF'
+          MiyooAI benchmark package
+          Copy the MiyooAI folder to /mnt/SDCARD/App/ or another SD-card directory.
+          Run bench-stentor.sh and bench-syko.sh over SSH/terminal first.
+          Context is intentionally limited to 128 tokens for the first 128 MB RAM test.
+          EOF
+          du -h out/models/* | tee out/info/model-sizes.txt
+
+      - name: Upload MiyooAI package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-armv7-bench
+          path: out/
+          compression-level: 6
