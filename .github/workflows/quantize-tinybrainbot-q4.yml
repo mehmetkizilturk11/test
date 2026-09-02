@@ -1,0 +1,54 @@
+name: quantize-tinybrainbot-q4
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/quantize-tinybrainbot-q4.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build git python3 python3-pip
+          python3 -m pip install --break-system-packages --upgrade 'huggingface_hub[hf_xet]'
+          mkdir -p out/models out/info
+      - name: Clone pinned llama.cpp
+        run: |
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin b81c99b479d4c24e5eeca10de99032ebd343ef8f
+          git -C llama.cpp checkout --detach FETCH_HEAD
+      - name: Download official F16
+        run: |
+          hf download nkthebass/tinybrainbot-100m-v3-instruct --include '*f16.gguf' --local-dir tinybrain-hf
+          SRC=$(find tinybrain-hf -type f -iname '*f16.gguf' | head -n1)
+          test -n "$SRC"
+          cp "$SRC" out/models/TinyBrainBot-100M-v3-Instruct.F16.gguf
+      - name: Build quantizer
+        run: |
+          cmake -S llama.cpp -B llama.cpp/build-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF \
+            -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build llama.cpp/build-host --target llama-quantize -j2
+      - name: Quantize Q4_K_M
+        run: |
+          set -o pipefail
+          llama.cpp/build-host/bin/llama-quantize \
+            out/models/TinyBrainBot-100M-v3-Instruct.F16.gguf \
+            out/models/TinyBrainBot-100M-v3-Instruct.Q4_K_M.gguf Q4_K_M \
+            2>&1 | tee out/info/quant-q4km.txt
+          rm out/models/TinyBrainBot-100M-v3-Instruct.F16.gguf
+          ls -lh out/models/*.gguf | tee out/info/model-size.txt
+          sha256sum out/models/*.gguf | tee out/info/SHA256SUMS.txt
+      - name: Upload Q4
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiyooAI-TinyBrainBot100M-Q4
+          path: out/
+          compression-level: 6
