@@ -104,7 +104,10 @@ jobs:
         run: |
           hf download SupraLabs/Supra-50M-Instruct --local-dir supra-hf
           hf download pthinc/Asena_ESP32_MAX --include 'gguf/asena_esp32max_q4_k_m.gguf' --local-dir asena-hf
+          test -s supra-hf/Supra-50M-f16.gguf
           test -s asena-hf/gguf/asena_esp32max_q4_k_m.gguf
+          cp supra-hf/Supra-50M-f16.gguf models/Supra-50M-Instruct.F16.gguf
+          ls -lh models/Supra-50M-Instruct.F16.gguf | tee bench/supra-f16-size.txt
           ls -lh asena-hf/gguf/asena_esp32max_q4_k_m.gguf | tee bench/asena-q4-size.txt
 
       - name: HF reference outputs
@@ -113,32 +116,23 @@ jobs:
           import torch
           from transformers import AutoTokenizer, AutoModelForCausalLM
           torch.manual_seed(1)
-
           print('=== SUPRA HF ===')
           tok=AutoTokenizer.from_pretrained('supra-hf',clean_up_tokenization_spaces=False)
           m=AutoModelForCausalLM.from_pretrained('supra-hf').eval()
-          def supra_prompt(q):
-              return 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n'+q+'\n\n### Response:\n'
+          def p(q): return 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n'+q+'\n\n### Response:\n'
           for q in ['What is the capital of France? Answer with only the city.','What is 2+2? Answer briefly.','Explain gravity in one short sentence.']:
-              p=supra_prompt(q); ids=tok(p,return_tensors='pt').input_ids
+              ids=tok(p(q),return_tensors='pt').input_ids
               out=m.generate(ids,max_new_tokens=48,do_sample=True,temperature=0.7,top_k=50,top_p=0.9,repetition_penalty=1.15,pad_token_id=tok.eos_token_id)
               print('Q:',q); print('A:',repr(tok.decode(out[0,ids.shape[1]:],skip_special_tokens=True)))
           del m
-
           print('=== ASENA HF ===')
           tok=AutoTokenizer.from_pretrained('pthinc/Asena_ESP32_MAX')
           m=AutoModelForCausalLM.from_pretrained('pthinc/Asena_ESP32_MAX').eval()
-          def asena_prompt(q):
-              return 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n'+q+'\n\n### Response:\n'
           for q in ["Türkiye'nin başkenti neresi? Tek kelime cevap ver.",'2+2 kaçtır? Kısa cevap ver.','Merhaba, nasılsın?']:
-              p=asena_prompt(q); ids=tok(p,return_tensors='pt').input_ids
+              ids=tok(p(q),return_tensors='pt').input_ids
               out=m.generate(ids,max_new_tokens=48,do_sample=True,temperature=0.7,top_k=50,top_p=0.9,repetition_penalty=1.15,pad_token_id=tok.eos_token_id)
               print('Q:',q); print('A:',repr(tok.decode(out[0,ids.shape[1]:],skip_special_tokens=True)))
           PY
-
-      - name: Convert Supra F16 GGUF
-        run: |
-          python3 llama.cpp/convert_hf_to_gguf.py supra-hf --outfile models/Supra-50M-Instruct.F16.gguf --outtype f16 2>&1 | tee bench/supra-convert.txt
 
       - name: Build host runner and quantizer
         run: |
@@ -147,7 +141,9 @@ jobs:
 
       - name: Quantize Supra Q4_K_M
         run: |
+          set -o pipefail
           llama.cpp/build-host/bin/llama-quantize models/Supra-50M-Instruct.F16.gguf models/Supra-50M-Instruct.Q4_K_M.gguf Q4_K_M 2>&1 | tee bench/supra-quant.txt
+          test -s models/Supra-50M-Instruct.Q4_K_M.gguf
           rm models/Supra-50M-Instruct.F16.gguf
           ls -lh models/Supra-50M-Instruct.Q4_K_M.gguf | tee bench/supra-q4-size.txt
 
